@@ -92,6 +92,10 @@
     }
 
     @media print {
+      @page {
+        size: landscape;
+        margin: 10mm;
+      }
       .no-print {
         display: none !important;
       }
@@ -103,6 +107,9 @@
         page-break-inside: avoid;
         border: 1px solid #483728 !important;
         margin-bottom: 2rem !important;
+      }
+      .print-matrix {
+        page-break-before: always;
       }
     }
   </style>
@@ -527,36 +534,36 @@
         };
       }, [processedDays]);
 
-      const payrollAggregation = useMemo(() => {
-        const recordMap = {};
-        let unnamedTotalPayout = 0;
-        let unnamedTotalHours = 0;
+      const payrollMatrix = useMemo(() => {
+        const baristas = {};
+        let unnamed = { name: "UNNAMED", days: Array(periodLength).fill(0), totalHrs: 0, totalPayout: 0, isUnnamed: true };
 
-        processedDays.forEach(day => {
+        processedDays.forEach((day, dIdx) => {
           day.shifts.forEach(shift => {
             const hrs = parseFloat(shift.hrs) || 0;
             const payout = shift.payout || 0;
             const normalizedName = shift.name.trim();
 
             if (normalizedName) {
-              if (!recordMap[normalizedName]) {
-                recordMap[normalizedName] = { name: normalizedName, totalHours: 0, totalPayout: 0, shiftsCount: 0 };
+              if (!baristas[normalizedName]) {
+                baristas[normalizedName] = { name: normalizedName, days: Array(periodLength).fill(0), totalHrs: 0, totalPayout: 0 };
               }
-              recordMap[normalizedName].totalHours += hrs;
-              recordMap[normalizedName].totalPayout += payout;
-              recordMap[normalizedName].shiftsCount += 1;
+              baristas[normalizedName].days[dIdx] += hrs;
+              baristas[normalizedName].totalHrs += hrs;
+              baristas[normalizedName].totalPayout += payout;
             } else {
-              unnamedTotalHours += hrs;
-              unnamedTotalPayout += payout;
+              unnamed.days[dIdx] += hrs;
+              unnamed.totalHrs += hrs;
+              unnamed.totalPayout += payout;
             }
           });
         });
 
-        return {
-          baristas: Object.values(recordMap).sort((a, b) => a.name.localeCompare(b.name)),
-          unnamed: { totalHours: unnamedTotalHours, totalPayout: unnamedTotalPayout }
-        };
-      }, [processedDays]);
+        const sortedBaristas = Object.values(baristas).sort((a, b) => a.name.localeCompare(b.name));
+        if (unnamed.totalHrs > 0) sortedBaristas.push(unnamed);
+
+        return sortedBaristas;
+      }, [processedDays, periodLength]);
 
       const onDragOverSquare = (e) => { e.preventDefault(); setSquareHover(true); };
       const onDragLeaveSquare = () => setSquareHover(false);
@@ -578,15 +585,22 @@
         let csvContent = "data:text/csv;charset=utf-8,";
         csvContent += `${shopName} TIP POOL LEDGER\n`;
         csvContent += `PERIOD: ${formatLocalDateString(processedDays[0]?.dateIso)} - ${formatLocalDateString(processedDays[processedDays.length - 1]?.dateIso)}\n\n`;
-        csvContent += "BARISTA,HOURS,PAYOUT,RATE\n";
         
-        payrollAggregation.baristas.forEach(b => {
-          const rate = b.totalHours > 0 ? (b.totalPayout / b.totalHours).toFixed(2) : "0.00";
-          csvContent += `"${b.name}",${b.totalHours.toFixed(2)},${b.totalPayout.toFixed(2)},${rate}\n`;
+        csvContent += "BARISTA,";
+        processedDays.forEach(d => {
+           csvContent += `${d.dateIso} HRS,`;
         });
-        if (payrollAggregation.unnamed.totalPayout > 0) {
-          csvContent += `"UNNAMED",${payrollAggregation.unnamed.totalHours.toFixed(2)},${payrollAggregation.unnamed.totalPayout.toFixed(2)},-\n`;
-        }
+        csvContent += "TOTAL HRS,TOTAL PAYOUT,AVG RATE\n";
+        
+        payrollMatrix.forEach(b => {
+          const rate = b.totalHrs > 0 ? (b.totalPayout / b.totalHrs).toFixed(2) : "0.00";
+          csvContent += `"${b.name}",`;
+          b.days.forEach(hrs => {
+             csvContent += `${hrs > 0 ? hrs.toFixed(2) : ""},`;
+          });
+          csvContent += `${b.totalHrs.toFixed(2)},${b.totalPayout.toFixed(2)},${rate}\n`;
+        });
+        
         const encodedUri = encodeURI(csvContent);
         const link = document.createElement("a");
         link.setAttribute("href", encodedUri);
@@ -603,12 +617,10 @@
         txt += `TOTAL DISBURSED: $${totals.grandTotal.toFixed(2)}\n`;
         txt += `-----------------------------------\n\n`;
         txt += `PAYROLL:\n`;
-        payrollAggregation.baristas.forEach(b => {
-          txt += `${b.name}: ${b.totalHours.toFixed(2)}h  $${b.totalPayout.toFixed(2)}\n`;
+        payrollMatrix.forEach(b => {
+          txt += `${b.name}: ${b.totalHrs.toFixed(2)}h  $${b.totalPayout.toFixed(2)}\n`;
         });
-        if (payrollAggregation.unnamed.totalPayout > 0) {
-          txt += `UNASSIGNED: ${payrollAggregation.unnamed.totalHours.toFixed(2)}h  $${payrollAggregation.unnamed.totalPayout.toFixed(2)}\n`;
-        }
+        
         const textArea = document.createElement("textarea");
         textArea.value = txt;
         document.body.appendChild(textArea);
@@ -1067,63 +1079,75 @@
             </div>
 
             {/* PAYROLL SUMMARY */}
-            <section className={`col-span-12 border-t-8 border-brand-dark pt-8 mt-12 ${activeTab === 'payroll' ? 'block' : 'hidden no-print'}`}>
-              <div className="flex flex-col md:flex-row justify-between items-start md:items-end mb-10 gap-4">
+            <section className={`col-span-12 border-t-8 border-brand-dark pt-8 mt-12 print-matrix ${activeTab === 'payroll' ? 'block' : 'hidden print:block'}`}>
+              <div className="flex flex-col md:flex-row justify-between items-start md:items-end mb-10 gap-4 no-print">
                 <div>
-                  <h2 className="text-4xl font-bold uppercase tracking-tighter leading-none mb-2">PAYROLL</h2>
-                  <p className="text-[10px] font-bold uppercase tracking-widest text-brand-accent">Aggregated Period Summary</p>
+                  <h2 className="text-4xl font-bold uppercase tracking-tighter leading-none mb-2">PAYROLL MATRIX</h2>
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-brand-accent">Aggregated Daily Split & Hour Ledger</p>
                 </div>
-                <div className="flex gap-2 no-print">
+                <div className="flex gap-2">
                   <button onClick={handleCopyClipboard} className="px-6 py-3 text-[10px] font-bold uppercase tracking-widest swiss-border bg-brand-light hover:bg-brand-dark hover:text-white transition-colors">COPY</button>
                   <button onClick={handleExportCSV} className="px-6 py-3 text-[10px] font-bold uppercase tracking-widest bg-brand-dark text-white hover:bg-black transition-colors">EXPORT</button>
                 </div>
               </div>
 
-              <table className="w-full text-left text-sm mb-12">
-                <thead>
-                  <tr className="swiss-border-b-heavy text-[10px] uppercase font-bold tracking-widest">
-                    <th className="pb-4">NAME</th>
-                    <th className="pb-4 text-center">SHIFTS</th>
-                    <th className="pb-4 text-center">HOURS</th>
-                    <th className="pb-4 text-right">RATE</th>
-                    <th className="pb-4 text-right">TOTAL PAYOUT</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {payrollAggregation.baristas.map((barista) => {
-                    const effRate = barista.totalHours > 0 ? (barista.totalPayout / barista.totalHours).toFixed(2) : "0.00";
-                    return (
-                      <tr key={`payroll-${barista.name}`} className="swiss-border-b">
-                        <td className="py-4 font-bold text-base">{barista.name}</td>
-                        <td className="py-4 text-center">{barista.shiftsCount}</td>
-                        <td className="py-4 text-center font-bold">{barista.totalHours.toFixed(2)}</td>
-                        <td className="py-4 text-right text-[10px] uppercase tracking-widest">${effRate}/H</td>
-                        <td className="py-4 text-right font-bold text-lg">${barista.totalPayout.toFixed(2)}</td>
-                      </tr>
-                    );
-                  })}
-                  {payrollAggregation.unnamed.totalPayout > 0 && (
-                    <tr className="swiss-border-b bg-brand-light/50">
-                      <td className="py-4 font-bold italic">[UNNAMED]</td>
-                      <td className="py-4 text-center">-</td>
-                      <td className="py-4 text-center font-bold">{payrollAggregation.unnamed.totalHours.toFixed(2)}</td>
-                      <td className="py-4 text-right">-</td>
-                      <td className="py-4 text-right font-bold text-lg">${payrollAggregation.unnamed.totalPayout.toFixed(2)}</td>
+              {/* Print-only Header */}
+              <div className="hidden print:block mb-8">
+                <h2 className="text-2xl font-bold uppercase tracking-tighter leading-none mb-1">{shopName} - PAYROLL MATRIX</h2>
+                <p className="text-[10px] font-bold uppercase tracking-widest">{formatLocalDateString(processedDays[0]?.dateIso)} to {formatLocalDateString(processedDays[processedDays.length - 1]?.dateIso)}</p>
+              </div>
+
+              <div className="overflow-x-auto no-scrollbar pb-4">
+                <table className="w-full text-left text-xs border-collapse swiss-border">
+                  <thead>
+                    <tr>
+                      <th className="swiss-border p-3 text-[10px] uppercase font-bold tracking-widest bg-brand-light min-w-[120px]">BARISTA</th>
+                      {processedDays.map((day, idx) => {
+                        const rate = day.totalHours > 0 ? (day.tipsVal / day.totalHours).toFixed(2) : "0.00";
+                        return (
+                          <th key={`matrix-h-${idx}`} className="swiss-border p-2 text-center min-w-[45px]">
+                            <div className="text-[9px] uppercase font-bold tracking-widest">{day.dayLabel.slice(0,3)}</div>
+                            <div className="text-[8px] uppercase font-bold tracking-widest text-brand-dark/70">{day.dateIso.split('-').slice(1).join('/')}</div>
+                            <div className="text-[9px] font-bold mt-1 text-brand-accent">${rate}/h</div>
+                          </th>
+                        );
+                      })}
+                      <th className="swiss-border p-3 text-center text-[10px] uppercase font-bold tracking-widest bg-brand-light min-w-[80px]">TOTAL HRS</th>
+                      <th className="swiss-border p-3 text-right text-[10px] uppercase font-bold tracking-widest bg-brand-light min-w-[80px]">PAYOUT</th>
                     </tr>
-                  )}
-                </tbody>
-                <tfoot>
-                  <tr className="swiss-border-t-heavy">
-                    <td className="py-6 font-bold uppercase tracking-widest">GRAND TOTAL</td>
-                    <td className="py-6 text-center"></td>
-                    <td className="py-6 text-center font-bold text-lg">
-                      {(payrollAggregation.baristas.reduce((acc, b) => acc + b.totalHours, 0) + payrollAggregation.unnamed.totalHours).toFixed(2)}
-                    </td>
-                    <td className="py-6 text-right"></td>
-                    <td className="py-6 text-right font-bold text-2xl">${totals.grandTotal.toFixed(2)}</td>
-                  </tr>
-                </tfoot>
-              </table>
+                  </thead>
+                  <tbody>
+                    {payrollMatrix.map((barista, bIdx) => (
+                      <tr key={`matrix-b-${bIdx}`} className={barista.isUnnamed ? "bg-brand-light/50 italic" : "hover:bg-brand-light/20"}>
+                        <td className="swiss-border p-3 font-bold whitespace-nowrap">{barista.name}</td>
+                        {barista.days.map((hrs, hIdx) => (
+                          <td key={`matrix-d-${bIdx}-${hIdx}`} className="swiss-border p-2 text-center text-[10px] font-bold">
+                            {hrs > 0 ? hrs.toFixed(2) : '-'}
+                          </td>
+                        ))}
+                        <td className="swiss-border p-3 text-center font-bold text-sm bg-brand-light/30">{barista.totalHrs.toFixed(2)}</td>
+                        <td className="swiss-border p-3 text-right font-bold text-sm bg-brand-light/30">${barista.totalPayout.toFixed(2)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                  <tfoot>
+                    <tr className="bg-brand-dark text-white">
+                      <td className="swiss-border p-3 font-bold uppercase tracking-widest text-[10px]">DAILY TOTALS</td>
+                      {processedDays.map((day, idx) => (
+                        <td key={`matrix-f-${idx}`} className="swiss-border p-2 text-center text-[10px] font-bold">
+                          {day.totalHours > 0 ? day.totalHours.toFixed(2) : '-'}
+                        </td>
+                      ))}
+                      <td className="swiss-border p-3 text-center font-bold text-sm">
+                        {payrollMatrix.reduce((acc, b) => acc + b.totalHrs, 0).toFixed(2)}
+                      </td>
+                      <td className="swiss-border p-3 text-right font-bold text-base">
+                        ${totals.grandTotal.toFixed(2)}
+                      </td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
             </section>
 
           </div>
