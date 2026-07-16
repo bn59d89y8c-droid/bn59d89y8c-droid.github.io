@@ -1,0 +1,1289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Herkimer Tip Split Ledger</title>
+  
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- React and Babel CDNs -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- SheetJS for processing Excel and raw CSV timesheets -->
+  <script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Verdana', 'Geneva', 'sans-serif'],
+          },
+          colors: {
+            brand: {
+              accent: '#6BA5B8',       // Muted Teal Accent
+              light: '#EDEFEC',        // Cool Linen Background
+              dark: '#483728',         // Deep Roast Brown
+              border: '#483728',       // Uniform dark borders
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <style>
+    body {
+      background-color: #EDEFEC;
+      color: #483728;
+      font-family: 'Verdana', 'Geneva', sans-serif;
+    }
+    input, select, textarea, button {
+      font-family: 'Verdana', 'Geneva', sans-serif;
+    }
+    .no-scrollbar::-webkit-scrollbar {
+      display: none;
+    }
+    .no-scrollbar {
+      -ms-overflow-style: none;
+      scrollbar-width: none;
+    }
+    .sharp-border {
+      border: 1px solid #483728;
+    }
+    .thick-border-bottom {
+      border-bottom: 3px solid #483728;
+    }
+    .border-double-bottom {
+      border-bottom: 4px double #483728;
+    }
+    .border-double-top {
+      border-top: 4px double #483728;
+    }
+    @media print {
+      .no-print {
+        display: none !important;
+      }
+      body {
+        background-color: white !important;
+        font-size: 11px;
+      }
+      .print-card {
+        page-break-inside: avoid;
+        border: 1px solid #483728 !important;
+        box-shadow: none !important;
+        margin-bottom: 2rem !important;
+      }
+    }
+  </style>
+</head>
+<body class="font-sans antialiased text-brand-dark">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo } = React;
+
+    const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+    // Date Utilities
+    function normalizeDateString(str) {
+      if (!str) return null;
+      let clean = str.trim().replace(/['"]/g, '').replace(/\s+/g, ' ');
+      
+      let m = clean.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+      if (m) {
+        let year = m[3];
+        if (year.length === 2) year = "20" + year;
+        return `${year}-${String(m[1]).padStart(2, '0')}-${String(m[2]).padStart(2, '0')}`;
+      }
+      
+      m = clean.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+      if (m) {
+        return `${m[1]}-${String(m[2]).padStart(2, '0')}-${String(m[3]).padStart(2, '0')}`;
+      }
+      
+      const months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+      let cleanFuzzy = clean.toLowerCase().replace(/,/g, '').trim();
+      let parts = cleanFuzzy.split(/\s+/);
+      if (parts.length >= 3) {
+        let monthIdx = months.findIndex(mName => parts[0].startsWith(mName));
+        if (monthIdx !== -1) {
+          let monthStr = String(monthIdx + 1).padStart(2, '0');
+          let dayStr = String(parseInt(parts[1], 10)).padStart(2, '0');
+          let yearStr = parts[2];
+          if (yearStr.length === 2) yearStr = "20" + yearStr;
+          if (yearStr.length === 4) {
+            return `${yearStr}-${monthStr}-${dayStr}`;
+          }
+        }
+      }
+      return null;
+    }
+
+    function dateDiff(d1Str, d2Str) {
+      const [y1,m1,D1] = d1Str.split('-').map(Number);
+      const [y2,m2,D2] = d2Str.split('-').map(Number);
+      const a = new Date(y1, m1-1, D1);
+      const b = new Date(y2, m2-1, D2);
+      return Math.round((b - a) / 86400000);
+    }
+
+    // Unified Robust Parser
+    function parseFileToRows(file, callback) {
+      const reader = new FileReader();
+      const isCSV = file.name.toLowerCase().endsWith('.csv');
+
+      if (isCSV) {
+        reader.onload = (e) => {
+          const text = e.target.result;
+          const lines = text.split(/\r?\n/);
+          const rows = lines.map(line => {
+            const result = [];
+            let current = "";
+            let inQuotes = false;
+            for (let i = 0; i < line.length; i++) {
+              const char = line[i];
+              if (char === '"') {
+                inQuotes = !inQuotes;
+              } else if (char === ',' && !inQuotes) {
+                result.push(current.trim().replace(/^"|"$/g, ''));
+                current = "";
+              } else {
+                current += char;
+              }
+            }
+            result.push(current.trim().replace(/^"|"$/g, ''));
+            return result;
+          });
+          callback(rows);
+        };
+        reader.readAsText(file);
+      } else {
+        reader.onload = (e) => {
+          try {
+            const data = e.target.result;
+            const workbook = XLSX.read(data, { type: 'binary' });
+            const sheetName = workbook.SheetNames[0];
+            const worksheet = workbook.Sheets[sheetName];
+            const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+            callback(rows);
+          } catch (err) {
+            console.error(err);
+            alert("Error reading spreadsheet format.");
+          }
+        };
+        reader.readAsBinaryString(file);
+      }
+    }
+
+    function App() {
+      // Auto-Detecting State
+      const [startDate, setStartDate] = useState(() => {
+        const d = new Date();
+        const day = d.getDay();
+        const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+        return new Date(d.setDate(diff)).toISOString().split('T')[0];
+      });
+      const [periodLength, setPeriodLength] = useState(7); // Dynamically shifts between 7 and 14
+      const [shopName, setShopName] = useState("Herkimer Coffee");
+      
+      // Core Data Dictionaries
+      const [dailyTips, setDailyTips] = useState({}); // { '2026-06-01': "234.15" }
+      const [dailyShifts, setDailyShifts] = useState({}); // { '2026-06-01': [ { id, shift, hrs, name } ] }
+
+      const [activeTab, setActiveTab] = useState("all"); 
+      const [toast, setToast] = useState(null);
+      const [showResetModal, setShowResetModal] = useState(false);
+
+      const [tipsFileName, setTipsFileName] = useState("");
+      const [hoursFileName, setHoursFileName] = useState("");
+
+      const [squareHover, setSquareHover] = useState(false);
+      const [homebaseHover, setHomebaseHover] = useState(false);
+
+      const triggerToast = (message, type = "success") => {
+        setToast({ message, type });
+        setTimeout(() => setToast(null), 4000);
+      };
+
+      const formatLocalDateString = (isoStr) => {
+        if (!isoStr) return "";
+        const [year, month, day] = isoStr.split('-').map(Number);
+        const dObj = new Date(year, month - 1, day);
+        return dObj.toLocaleDateString('en-US', {
+          weekday: 'long',
+          month: 'long',
+          day: 'numeric',
+          year: 'numeric'
+        });
+      };
+
+      // ---------------------------------------------------------
+      // FILE IMPORTERS (WITH AUTO RANGE & SHOP DETECTION)
+      // ---------------------------------------------------------
+
+      const handleSquareTipsImport = (file) => {
+        if (!file) return;
+        parseFileToRows(file, (rows) => {
+          let salesRow = null;
+          let tipRow = null;
+
+          for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            if (!row || row.length === 0) continue;
+            const firstVal = String(row[0]).trim();
+            if (firstVal === "Sales" && row.slice(1).some(cell => String(cell).includes("/") || String(cell).includes("-"))) {
+              salesRow = row;
+            } else if (firstVal === "Tip" && row.length > 1) {
+              tipRow = row;
+            }
+          }
+
+          let validDates = [];
+          let parsedTips = {};
+
+          if (salesRow && tipRow) {
+            for (let colIdx = 1; colIdx < salesRow.length; colIdx++) {
+              const dateRaw = salesRow[colIdx];
+              const normalizedDate = normalizeDateString(String(dateRaw));
+              if (normalizedDate) {
+                validDates.push(normalizedDate);
+                const rawVal = tipRow[colIdx] || "0";
+                parsedTips[normalizedDate] = String(parseFloat(String(rawVal).replace(/[^0-9.]/g, '')) || 0);
+              }
+            }
+          } else {
+            let dateColIdx = -1;
+            let tipColIdx = -1;
+            for (let i = 0; i < rows.length; i++) {
+              const row = rows[i];
+              if (!row) continue;
+              for (let c = 0; c < row.length; c++) {
+                const val = String(row[c]).toLowerCase();
+                if (val.includes("date") || val.includes("day")) dateColIdx = c;
+                if (val.includes("tip") || val.includes("gratuity")) tipColIdx = c;
+              }
+              if (dateColIdx !== -1 && tipColIdx !== -1) {
+                for (let r = i + 1; r < rows.length; r++) {
+                  const dataRow = rows[r];
+                  if (!dataRow || !dataRow[dateColIdx]) continue;
+                  const normalizedDate = normalizeDateString(String(dataRow[dateColIdx]));
+                  if (normalizedDate) {
+                    validDates.push(normalizedDate);
+                    parsedTips[normalizedDate] = String(parseFloat(String(dataRow[tipColIdx]).replace(/[^0-9.]/g, '')) || 0);
+                  }
+                }
+                break;
+              }
+            }
+          }
+
+          if (validDates.length > 0) {
+            validDates.sort();
+            const d1 = validDates[0];
+            const d2 = validDates[validDates.length - 1];
+            const diff = dateDiff(d1, d2);
+            
+            // Square often includes an extra trailing day. 
+            // If diff is <= 8, it's a 1-week period. If > 8, it's 2-week.
+            const newLength = diff <= 8 ? 7 : 14;
+
+            setStartDate(d1);
+            setPeriodLength(newLength);
+            setDailyTips(prev => ({ ...prev, ...parsedTips }));
+            setTipsFileName(file.name);
+            triggerToast(`Successfully loaded tip pools and updated date range.`);
+          } else {
+            triggerToast("No readable dates in CSV.", "error");
+          }
+        });
+      };
+
+      const handleHomebaseHoursImport = (file) => {
+        if (!file) return;
+        parseFileToRows(file, (rows) => {
+          let nameIdx = -1;
+          let dateIdx = -1;
+          let hrsIdx = -1;
+          let clockInIdx = -1;
+          let clockOutIdx = -1;
+
+          const hoursByDateAndName = {};
+
+          // Extract Shop Name / Period from the first two rows (Homebase standard)
+          const shopRow = rows[0];
+          if (shopRow && shopRow[0] && typeof shopRow[0] === 'string') {
+            const possibleShop = shopRow[0].split('-')[0].trim();
+            if (possibleShop) setShopName(possibleShop);
+          }
+          const periodRow = rows.find(r => String(r[0]).toLowerCase().includes('payroll period'));
+          if (periodRow && periodRow[1]) {
+            const parts = String(periodRow[1]).toLowerCase().split(' to ');
+            if (parts.length === 2) {
+              const d1 = normalizeDateString(parts[0]);
+              const d2 = normalizeDateString(parts[1]);
+              if (d1 && d2) {
+                setStartDate(d1);
+                const diff = dateDiff(d1, d2) + 1;
+                setPeriodLength(diff > 7 ? 14 : 7);
+              }
+            }
+          }
+
+          // Parse shifts
+          for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            if (!row) continue;
+
+            const isHeaderRow = row.some(cell => {
+              const val = String(cell).toLowerCase();
+              return val.includes("clock in date") || val.includes("actual hours");
+            });
+
+            if (isHeaderRow) {
+              for (let c = 0; c < row.length; c++) {
+                const val = String(row[c]).toLowerCase().trim();
+                if (val === "name" || val === "employee" || val.includes("employee name")) nameIdx = c;
+                if (val === "clock in date" || val === "work date" || val === "date" || val.includes("date")) dateIdx = c;
+                if (val === "actual hours" || val === "hours worked" || val === "hours" || val.includes("hours")) hrsIdx = c;
+                if (val === "clock in time" || val === "in time") clockInIdx = c;
+                if (val === "clock out time" || val === "out time") clockOutIdx = c;
+              }
+              continue;
+            }
+
+            if (nameIdx !== -1 && dateIdx !== -1 && hrsIdx !== -1) {
+              const name = String(row[nameIdx] || "").trim();
+              const rawDate = String(row[dateIdx] || "");
+              const hrsVal = parseFloat(String(row[hrsIdx] || "").replace(/[^0-9.]/g, '')) || 0;
+
+              const nameLower = name.toLowerCase();
+              if (!name || nameLower.includes("total") || nameLower === "name" || nameLower === "employee" || nameLower.includes("unnamed")) {
+                continue;
+              }
+
+              const normalizedDate = normalizeDateString(rawDate);
+              const timeIn = clockInIdx !== -1 ? String(row[clockInIdx] || "").trim() : "";
+              const timeOut = clockOutIdx !== -1 ? String(row[clockOutIdx] || "").trim() : "";
+              const shiftLabel = (timeIn && timeOut) ? `${timeIn}-${timeOut}` : "Shift";
+
+              if (normalizedDate && hrsVal > 0) {
+                if (!hoursByDateAndName[normalizedDate]) hoursByDateAndName[normalizedDate] = [];
+                hoursByDateAndName[normalizedDate].push({ name, hrs: hrsVal, shift: shiftLabel });
+              }
+            }
+          }
+
+          let loadedShiftsCount = 0;
+          setDailyShifts(prev => {
+            const next = { ...prev };
+            for (const [dateIso, workers] of Object.entries(hoursByDateAndName)) {
+              const generatedShifts = workers.map((w, sIdx) => {
+                loadedShiftsCount++;
+                return {
+                  id: `${dateIso}-imp-${sIdx}-${Date.now()}`,
+                  shift: w.shift,
+                  hrs: w.hrs,
+                  name: w.name
+                };
+              });
+              // Overwrite if previously loaded to avoid compounding duplicates
+              next[dateIso] = generatedShifts;
+            }
+            return next;
+          });
+
+          if (loadedShiftsCount > 0) {
+            setHoursFileName(file.name);
+            triggerToast(`Generated ${loadedShiftsCount} shifts. Dates and shop location adapted.`);
+          } else {
+            triggerToast("No shifts found in timesheet.", "error");
+          }
+        });
+      };
+
+      // ---------------------------------------------------------
+      // MANUAL DATA MUTATION
+      // ---------------------------------------------------------
+      const handleShiftNameChange = (isoDate, shiftId, value) => {
+        updateShift(isoDate, shiftId, "shift", value);
+      };
+
+      const handleNameChange = (isoDate, shiftId, value) => {
+        updateShift(isoDate, shiftId, "name", value);
+      };
+
+      const handleHoursChange = (isoDate, shiftId, value) => {
+        updateShift(isoDate, shiftId, "hrs", parseFloat(value) || 0);
+      };
+
+      const updateShift = (isoDate, shiftId, field, value) => {
+        setDailyShifts(prev => {
+          const dayShifts = prev[isoDate] || [];
+          return {
+            ...prev,
+            [isoDate]: dayShifts.map(s => s.id === shiftId ? { ...s, [field]: value } : s)
+          };
+        });
+      };
+
+      const addCustomShift = (isoDate) => {
+        setDailyShifts(prev => {
+          const dayShifts = prev[isoDate] || [];
+          return {
+            ...prev,
+            [isoDate]: [...dayShifts, { id: `${isoDate}-${Date.now()}`, shift: "Custom Shift", hrs: 0, name: "" }]
+          };
+        });
+      };
+
+      const deleteShift = (isoDate, shiftId) => {
+        setDailyShifts(prev => {
+          const dayShifts = prev[isoDate] || [];
+          return {
+            ...prev,
+            [isoDate]: dayShifts.filter(s => s.id !== shiftId)
+          };
+        });
+      };
+
+      const handleTipChange = (isoDate, val) => {
+        setDailyTips(prev => ({ ...prev, [isoDate]: val === "" ? "0" : val }));
+      };
+
+      const handleResetAll = () => {
+        setDailyTips({});
+        setDailyShifts({});
+        setTipsFileName("");
+        setHoursFileName("");
+        setShopName("Herkimer Coffee");
+        setShowResetModal(false);
+        triggerToast("Ledger fully wiped to a blank slate.");
+      };
+
+      // ---------------------------------------------------------
+      // DYNAMIC RENDER PROCESSOR
+      // ---------------------------------------------------------
+      const processedDays = useMemo(() => {
+        const dates = [];
+        const baseDate = new Date(startDate + "T00:00:00");
+
+        for (let i = 0; i < periodLength; i++) {
+          const temp = new Date(baseDate);
+          temp.setDate(baseDate.getDate() + i);
+          
+          const y = temp.getFullYear();
+          const m = String(temp.getMonth() + 1).padStart(2, '0');
+          const d = String(temp.getDate()).padStart(2, '0');
+          const iso = `${y}-${m}-${d}`;
+          
+          const dayName = DAY_NAMES[temp.getDay()];
+          const tipsVal = parseFloat(dailyTips[iso]) || 0;
+          const shifts = dailyShifts[iso] || [];
+          const totalHours = shifts.reduce((acc, s) => acc + (parseFloat(s.hrs) || 0), 0);
+          
+          let isBalanced = true;
+          let totalPaidOut = 0;
+          let calculatedShifts = shifts.map(s => ({ ...s, payout: 0 }));
+
+          if (totalHours > 0 && tipsVal > 0) {
+            let cumulativeHrs = 0;
+            let prevCumulPayout = 0;
+            calculatedShifts = shifts.map(shift => {
+               const hrs = parseFloat(shift.hrs) || 0;
+               cumulativeHrs += hrs;
+               const currentCumulPayout = Math.round((tipsVal * cumulativeHrs / totalHours) * 100) / 100;
+               const shiftPayout = Math.round((currentCumulPayout - prevCumulPayout) * 100) / 100;
+               prevCumulPayout = currentCumulPayout;
+               return { ...shift, payout: shiftPayout };
+            });
+            totalPaidOut = calculatedShifts.reduce((acc, s) => acc + s.payout, 0);
+            isBalanced = Math.abs(totalPaidOut - tipsVal) < 0.001;
+          }
+
+          dates.push({
+            dateIso: iso,
+            dayLabel: dayName,
+            shifts: calculatedShifts,
+            totalHours,
+            tipsVal,
+            isBalanced,
+            totalPaidOut
+          });
+        }
+        return dates;
+      }, [startDate, periodLength, dailyTips, dailyShifts]);
+
+      const totals = useMemo(() => {
+        let week1Sum = 0;
+        let week2Sum = 0;
+        processedDays.forEach((day, index) => {
+          if (index < 7) week1Sum += day.tipsVal;
+          else week2Sum += day.tipsVal;
+        });
+        return {
+          week1: week1Sum,
+          week2: week2Sum,
+          grandTotal: week1Sum + week2Sum
+        };
+      }, [processedDays]);
+
+      const payrollAggregation = useMemo(() => {
+        const recordMap = {};
+        let unnamedTotalPayout = 0;
+        let unnamedTotalHours = 0;
+
+        processedDays.forEach(day => {
+          day.shifts.forEach(shift => {
+            const hrs = parseFloat(shift.hrs) || 0;
+            const payout = shift.payout || 0;
+            const normalizedName = shift.name.trim();
+
+            if (normalizedName) {
+              if (!recordMap[normalizedName]) {
+                recordMap[normalizedName] = { name: normalizedName, totalHours: 0, totalPayout: 0, shiftsCount: 0 };
+              }
+              recordMap[normalizedName].totalHours += hrs;
+              recordMap[normalizedName].totalPayout += payout;
+              recordMap[normalizedName].shiftsCount += 1;
+            } else {
+              unnamedTotalHours += hrs;
+              unnamedTotalPayout += payout;
+            }
+          });
+        });
+
+        return {
+          baristas: Object.values(recordMap).sort((a, b) => a.name.localeCompare(b.name)),
+          unnamed: { totalHours: unnamedTotalHours, totalPayout: unnamedTotalPayout }
+        };
+      }, [processedDays]);
+
+      // Drag and drop wiring
+      const onDragOverSquare = (e) => { e.preventDefault(); setSquareHover(true); };
+      const onDragLeaveSquare = () => setSquareHover(false);
+      const onDropSquare = (e) => {
+        e.preventDefault();
+        setSquareHover(false);
+        if (e.dataTransfer.files && e.dataTransfer.files[0]) handleSquareTipsImport(e.dataTransfer.files[0]);
+      };
+
+      const onDragOverHomebase = (e) => { e.preventDefault(); setHomebaseHover(true); };
+      const onDragLeaveHomebase = () => setHomebaseHover(false);
+      const onDropHomebase = (e) => {
+        e.preventDefault();
+        setHomebaseHover(false);
+        if (e.dataTransfer.files && e.dataTransfer.files[0]) handleHomebaseHoursImport(e.dataTransfer.files[0]);
+      };
+
+      // Exporters
+      const handleExportCSV = () => {
+        let csvContent = "data:text/csv;charset=utf-8,";
+        csvContent += `${shopName} Tip Pool Ledger\n`;
+        csvContent += `Pay Period: ${formatLocalDateString(processedDays[0]?.dateIso)} - ${formatLocalDateString(processedDays[processedDays.length - 1]?.dateIso)}\n\n`;
+        csvContent += "Barista,Total Hours Worked,Total Tip Payout ($),Effective Rate ($/hr)\n";
+        
+        payrollAggregation.baristas.forEach(b => {
+          const rate = b.totalHours > 0 ? (b.totalPayout / b.totalHours).toFixed(2) : "0.00";
+          csvContent += `"${b.name}",${b.totalHours.toFixed(2)},${b.totalPayout.toFixed(2)},${rate}\n`;
+        });
+        if (payrollAggregation.unnamed.totalPayout > 0) {
+          csvContent += `"Unnamed Shifts",${payrollAggregation.unnamed.totalHours.toFixed(2)},${payrollAggregation.unnamed.totalPayout.toFixed(2)},-\n`;
+        }
+        const encodedUri = encodeURI(csvContent);
+        const link = document.createElement("a");
+        link.setAttribute("href", encodedUri);
+        link.setAttribute("download", `${shopName}_Tips_${startDate}.csv`);
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      };
+
+      const handleCopyClipboard = () => {
+        let txt = `${shopName.toUpperCase()} TIP SUMMARY\n`;
+        txt += `Period: ${formatLocalDateString(processedDays[0]?.dateIso)} to ${formatLocalDateString(processedDays[processedDays.length - 1]?.dateIso)}\n`;
+        txt += `-----------------------------------\n`;
+        txt += `Total Pool Disbursed: $${totals.grandTotal.toFixed(2)}\n`;
+        txt += `-----------------------------------\n\n`;
+        txt += `PAYROLL SUMMARY:\n`;
+        payrollAggregation.baristas.forEach(b => {
+          txt += `- ${b.name}: ${b.totalHours.toFixed(2)} hours ➔ $${b.totalPayout.toFixed(2)}\n`;
+        });
+        if (payrollAggregation.unnamed.totalPayout > 0) {
+          txt += `- Unassigned: ${payrollAggregation.unnamed.totalHours.toFixed(2)} hours ➔ $${payrollAggregation.unnamed.totalPayout.toFixed(2)}\n`;
+        }
+        const textArea = document.createElement("textarea");
+        textArea.value = txt;
+        document.body.appendChild(textArea);
+        textArea.select();
+        try {
+          document.execCommand('copy');
+          triggerToast("Summary copied to clipboard");
+        } catch (err) {
+          triggerToast("Clipboard block detected.", "error");
+        }
+        document.body.removeChild(textArea);
+      };
+
+      useEffect(() => {
+        if (periodLength === 7 && activeTab === "week2") setActiveTab("all");
+      }, [periodLength, activeTab]);
+
+      return (
+        <div class="min-h-screen pb-20 flex flex-col selection:bg-brand-accent selection:text-white">
+          
+          {/* Toast */}
+          {toast && (
+            <div class="fixed bottom-6 right-6 z-50 flex items-center px-4 py-3 bg-white sharp-border shadow-md animate-pulse">
+              <div class="w-2.5 h-2.5 bg-brand-accent mr-3"></div>
+              <span class="text-xs font-bold uppercase tracking-wider text-brand-dark">{toast.message}</span>
+            </div>
+          )}
+
+          {/* Reset Modal */}
+          {showResetModal && (
+            <div class="fixed inset-0 bg-black/20 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+              <div class="bg-white max-w-sm w-full p-8 sharp-border shadow-xl">
+                <h3 class="text-sm uppercase tracking-wider font-extrabold text-brand-dark mb-4 border-b border-brand-dark pb-2">Clear Ledger?</h3>
+                <p class="text-xs text-brand-dark mb-8 leading-relaxed">
+                  This will completely wipe all imported tips, hours, and custom shift configurations, returning to a blank canvas.
+                </p>
+                <div class="flex space-x-3 justify-end text-xs">
+                  <button 
+                    onClick={() => setShowResetModal(false)}
+                    class="px-4 py-2 font-bold uppercase sharp-border bg-white text-brand-dark hover:bg-brand-light transition"
+                  >
+                    Cancel
+                  </button>
+                  <button 
+                    onClick={handleResetAll}
+                    class="px-4 py-2 font-bold uppercase sharp-border bg-brand-dark text-white hover:bg-brand-accent hover:border-brand-accent transition"
+                  >
+                    Clear All
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Header */}
+          <header class="bg-white thick-border-bottom py-8 px-6 no-print">
+            <div class="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center justify-between gap-4">
+              <div>
+                <h1 class="text-2xl md:text-3xl font-bold tracking-wider text-brand-dark uppercase">{shopName} Ledger</h1>
+                <p class="text-brand-dark text-xs mt-1 tracking-wide uppercase font-bold">Auto-Detecting Tip Split & Accumulation Matrix</p>
+              </div>
+              <div class="flex items-center space-x-3 text-xs uppercase font-bold tracking-wider">
+                <button 
+                  onClick={() => window.print()}
+                  class="sharp-border bg-white text-brand-dark hover:bg-brand-accent hover:text-white hover:border-brand-accent transition px-4 py-2"
+                >
+                  Print Report
+                </button>
+                <button 
+                  onClick={() => setShowResetModal(true)}
+                  class="sharp-border bg-brand-dark text-white hover:bg-brand-accent hover:border-brand-accent transition px-4 py-2"
+                >
+                  Clear Form
+                </button>
+              </div>
+            </div>
+          </header>
+
+          <main class="max-w-7xl w-full mx-auto px-4 md:px-6 mt-8 flex-grow">
+            
+            {/* CONFIGURATION PANEL */}
+            <section class="bg-white p-6 sharp-border mb-8 no-print">
+              <div class="grid grid-cols-1 md:grid-cols-4 gap-6 items-center">
+                
+                <div class="md:col-span-1">
+                  <label class="block text-[10px] uppercase tracking-widest font-bold text-brand-dark mb-2">Period Length</label>
+                  <select
+                    value={periodLength}
+                    onChange={(e) => setPeriodLength(Number(e.target.value))}
+                    class="w-full bg-brand-light/50 sharp-border px-3 py-2.5 text-xs font-bold text-brand-dark focus:outline-none focus:bg-white focus:border-brand-accent cursor-pointer"
+                  >
+                    <option value={7}>1 Week</option>
+                    <option value={14}>2 Weeks</option>
+                  </select>
+                </div>
+
+                <div class="md:col-span-1">
+                  <label class="block text-[10px] uppercase tracking-widest font-bold text-brand-dark mb-2">Start Date</label>
+                  <input 
+                    type="date" 
+                    value={startDate}
+                    onChange={(e) => setStartDate(e.target.value)}
+                    class="w-full bg-brand-light/50 sharp-border px-3 py-2 text-xs font-bold text-brand-dark focus:outline-none focus:bg-white focus:border-brand-accent transition"
+                  />
+                </div>
+                
+                <div class="md:col-span-2 flex items-center space-x-4 bg-brand-light/50 p-4 sharp-border h-full">
+                  <div class="flex-grow">
+                    <span class="block text-[10px] uppercase tracking-widest font-bold text-brand-dark">Calculated Boundary</span>
+                    <span class="text-xs font-bold text-brand-dark mt-1 block">
+                      {processedDays[0]?.dateIso ? formatLocalDateString(processedDays[0].dateIso) : "..."} 
+                      <span class="mx-3 text-brand-accent">➔</span> 
+                      {processedDays[periodLength - 1]?.dateIso ? formatLocalDateString(processedDays[periodLength - 1].dateIso) : "..."}
+                    </span>
+                  </div>
+                  <div class="sharp-border bg-white text-brand-dark text-[10px] uppercase tracking-wider px-3 py-1 font-bold">
+                    {periodLength} Days
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            {/* DRAG-AND-DROP FILE UPLOAD WORKSPACES */}
+            <section class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8 no-print">
+              
+              <div 
+                onDragOver={onDragOverSquare}
+                onDragLeave={onDragLeaveSquare}
+                onDrop={onDropSquare}
+                class={`bg-white p-6 sharp-border transition relative flex flex-col justify-between min-h-[180px] ${squareHover ? 'border-brand-accent bg-brand-light' : ''}`}
+              >
+                <div>
+                  <div class="flex justify-between items-start mb-2">
+                    <span class="text-[10px] uppercase tracking-widest font-bold text-brand-accent">Data Import</span>
+                    {tipsFileName && (
+                      <span class="text-[9px] bg-brand-accent text-white sharp-border px-2 py-0.5 font-bold uppercase tracking-wider">Loaded</span>
+                    )}
+                  </div>
+                  <h3 class="text-sm uppercase tracking-wider font-bold text-brand-dark">Square Tip Report</h3>
+                  <p class="text-[11px] text-brand-dark mt-2 leading-relaxed">
+                    Drop your Square CSV Daily Interval Report. Period boundaries update automatically.
+                  </p>
+                  {tipsFileName && (
+                    <p class="text-[10px] text-brand-accent font-bold mt-2 truncate">{tipsFileName}</p>
+                  )}
+                </div>
+                <div class="mt-4">
+                  <label class="cursor-pointer sharp-border bg-brand-dark text-white hover:bg-brand-accent hover:border-brand-accent text-[10px] uppercase tracking-widest font-bold py-2 px-4 block text-center transition">
+                    Upload Tips CSV
+                    <input 
+                      type="file" 
+                      accept=".csv, .xlsx, .xls" 
+                      onChange={(e) => handleSquareTipsImport(e.target.files[0])} 
+                      class="hidden" 
+                    />
+                  </label>
+                </div>
+              </div>
+
+              <div 
+                onDragOver={onDragOverHomebase}
+                onDragLeave={onDragLeaveHomebase}
+                onDrop={onDropHomebase}
+                class={`bg-white p-6 sharp-border transition relative flex flex-col justify-between min-h-[180px] ${homebaseHover ? 'border-brand-accent bg-brand-light' : ''}`}
+              >
+                <div>
+                  <div class="flex justify-between items-start mb-2">
+                    <span class="text-[10px] uppercase tracking-widest font-bold text-brand-accent">Data Import</span>
+                    {hoursFileName && (
+                      <span class="text-[9px] bg-brand-accent text-white sharp-border px-2 py-0.5 font-bold uppercase tracking-wider">Loaded</span>
+                    )}
+                  </div>
+                  <h3 class="text-sm uppercase tracking-wider font-bold text-brand-dark">Homebase Hours</h3>
+                  <p class="text-[11px] text-brand-dark mt-2 leading-relaxed">
+                    Drop your Homebase completed shift timesheet (Excel or CSV). Auto-detects shop name and period dates.
+                  </p>
+                  {hoursFileName && (
+                    <p class="text-[10px] text-brand-accent font-bold mt-2 truncate">{hoursFileName}</p>
+                  )}
+                </div>
+                <div class="mt-4">
+                  <label class="cursor-pointer sharp-border bg-brand-dark text-white hover:bg-brand-accent hover:border-brand-accent text-[10px] uppercase tracking-widest font-bold py-2 px-4 block text-center transition">
+                    Upload Hours File
+                    <input 
+                      type="file" 
+                      accept=".xlsx, .xls, .csv" 
+                      onChange={(e) => handleHomebaseHoursImport(e.target.files[0])} 
+                      class="hidden" 
+                    />
+                  </label>
+                </div>
+              </div>
+
+            </section>
+
+            {/* MANUAL ADJUSTMENTS MATRIX */}
+            <section class="bg-white p-6 sharp-border mb-8 no-print">
+              <div class="thick-border-bottom pb-4 mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+                <h2 class="text-sm uppercase tracking-wider font-bold text-brand-dark">Daily Tip Pools</h2>
+                <div class="flex items-center space-x-4">
+                  <span class="text-[10px] uppercase tracking-widest font-bold text-brand-dark">Total Sum:</span>
+                  <span class="text-lg font-black text-brand-dark">${totals.grandTotal.toFixed(2)}</span>
+                </div>
+              </div>
+
+              {/* Week 1 Tips */}
+              <div class="mb-6">
+                <div class="flex justify-between items-center mb-2">
+                  <h3 class="text-xs font-bold text-brand-dark uppercase tracking-wider">Week 1</h3>
+                  <span class="text-[10px] font-bold text-brand-dark">Subtotal: ${totals.week1.toFixed(2)}</span>
+                </div>
+                <div class={`grid grid-cols-2 sm:grid-cols-4 ${periodLength === 7 ? 'lg:grid-cols-7' : 'lg:grid-cols-8'} gap-3`}>
+                  {processedDays.slice(0, 7).map((day, index) => {
+                    const shortDate = day.dateIso ? day.dateIso.split('-').slice(1).join('/') : "";
+                    return (
+                      <div key={`w1-tip-${index}`} class="bg-brand-light/50 p-2 sharp-border">
+                        <div class="text-[9px] font-bold text-brand-dark uppercase tracking-wider mb-1 flex justify-between">
+                          <span>{day.dayLabel.slice(0, 3)}</span>
+                          <span class="text-brand-accent">{shortDate}</span>
+                        </div>
+                        <div class="relative">
+                          <span class="absolute left-2 top-1/2 -translate-y-1/2 text-xs font-bold text-brand-dark">$</span>
+                          <input 
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            placeholder="0.00"
+                            value={dailyTips[day.dateIso] === "0" || !dailyTips[day.dateIso] ? "" : dailyTips[day.dateIso]}
+                            onChange={(e) => handleTipChange(day.dateIso, e.target.value)}
+                            class="w-full bg-white sharp-border px-5 py-1 text-xs font-bold text-brand-dark focus:outline-none focus:border-brand-accent transition"
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {periodLength === 14 && (
+                    <div class="bg-brand-dark text-white p-2 sharp-border flex flex-col justify-between col-span-2 lg:col-span-1">
+                      <span class="text-[9px] uppercase font-bold tracking-widest text-brand-light">W1 Sum</span>
+                      <span class="text-sm font-bold">${totals.week1.toFixed(2)}</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Week 2 Tips (Only show if 14 days selected) */}
+              {periodLength === 14 && (
+                <div>
+                  <div class="flex justify-between items-center mb-2">
+                    <h3 class="text-xs font-bold text-brand-dark uppercase tracking-wider">Week 2</h3>
+                    <span class="text-[10px] font-bold text-brand-dark">Subtotal: ${totals.week2.toFixed(2)}</span>
+                  </div>
+                  <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
+                    {processedDays.slice(7, 14).map((day, index) => {
+                      const shortDate = day.dateIso ? day.dateIso.split('-').slice(1).join('/') : "";
+                      return (
+                        <div key={`w2-tip-${index}`} class="bg-brand-light/50 p-2 sharp-border">
+                          <div class="text-[9px] font-bold text-brand-dark uppercase tracking-wider mb-1 flex justify-between">
+                            <span>{day.dayLabel.slice(0, 3)}</span>
+                            <span class="text-brand-accent">{shortDate}</span>
+                          </div>
+                          <div class="relative">
+                            <span class="absolute left-2 top-1/2 -translate-y-1/2 text-xs font-bold text-brand-dark">$</span>
+                            <input 
+                              type="number"
+                              step="0.01"
+                              min="0"
+                              placeholder="0.00"
+                              value={dailyTips[day.dateIso] === "0" || !dailyTips[day.dateIso] ? "" : dailyTips[day.dateIso]}
+                              onChange={(e) => handleTipChange(day.dateIso, e.target.value)}
+                              class="w-full bg-white sharp-border px-5 py-1 text-xs font-bold text-brand-dark focus:outline-none focus:border-brand-accent transition"
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                    <div class="bg-brand-dark text-white p-2 sharp-border flex flex-col justify-between col-span-2 lg:col-span-1">
+                      <span class="text-[9px] uppercase font-bold tracking-widest text-brand-light">W2 Sum</span>
+                      <span class="text-sm font-bold">${totals.week2.toFixed(2)}</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </section>
+
+            {/* VIEW FILTERS */}
+            <section class="mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4 no-print text-[10px] font-bold uppercase tracking-widest">
+              <div class="flex flex-wrap gap-2">
+                <button 
+                  onClick={() => setActiveTab("all")}
+                  class={`sharp-border px-4 py-2 transition ${activeTab === 'all' ? 'bg-brand-dark text-white' : 'bg-white text-brand-dark hover:bg-brand-light'}`}
+                >
+                  All Days
+                </button>
+                {periodLength === 14 && (
+                  <React.Fragment>
+                    <button 
+                      onClick={() => setActiveTab("week1")}
+                      class={`sharp-border px-4 py-2 transition ${activeTab === 'week1' ? 'bg-brand-dark text-white' : 'bg-white text-brand-dark hover:bg-brand-light'}`}
+                    >
+                      Week 1
+                    </button>
+                    <button 
+                      onClick={() => setActiveTab("week2")}
+                      class={`sharp-border px-4 py-2 transition ${activeTab === 'week2' ? 'bg-brand-dark text-white' : 'bg-white text-brand-dark hover:bg-brand-light'}`}
+                    >
+                      Week 2
+                    </button>
+                  </React.Fragment>
+                )}
+                <button 
+                  onClick={() => setActiveTab("payroll")}
+                  class={`sharp-border px-4 py-2 transition ${activeTab === 'payroll' ? 'bg-brand-accent border-brand-accent text-white' : 'bg-white text-brand-dark hover:bg-brand-light'}`}
+                >
+                  Payroll
+                </button>
+              </div>
+              <div class="flex gap-2">
+                <button 
+                  onClick={handleCopyClipboard}
+                  class="sharp-border bg-white text-brand-dark hover:bg-brand-light transition px-4 py-2"
+                >
+                  Copy Summary
+                </button>
+                <button 
+                  onClick={handleExportCSV}
+                  class="sharp-border bg-brand-dark text-white hover:bg-brand-accent hover:border-brand-accent transition px-4 py-2"
+                >
+                  Export CSV
+                </button>
+              </div>
+            </section>
+
+            {/* CHRONOLOGICAL SPLITTER GRID */}
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              
+              {/* WEEK 1 PANEL */}
+              {(activeTab === "all" || activeTab === "week1") && (
+                <div class="space-y-6">
+                  {processedDays.slice(0, 7).map((day) => {
+                    const formattedDateStr = day.dateIso ? formatLocalDateString(day.dateIso) : day.dayLabel;
+
+                    return (
+                      <div key={`day-card-${day.dateIso}`} class="bg-white sharp-border print-card">
+                        
+                        <div class="bg-white text-brand-dark p-4 flex items-center justify-between border-double-bottom">
+                          <div>
+                            <h3 class="font-bold text-sm uppercase tracking-widest">{day.dayLabel}</h3>
+                            <p class="text-[10px] uppercase tracking-widest mt-1 text-brand-accent">{formattedDateStr}</p>
+                          </div>
+                          <div class="text-right">
+                            <span class="text-[9px] uppercase tracking-widest block font-bold">Daily Tips</span>
+                            <span class="text-sm font-bold">${day.tipsVal.toFixed(2)}</span>
+                          </div>
+                        </div>
+
+                        <div class="p-4">
+                          <table class="w-full text-left text-xs border-collapse">
+                            <thead>
+                              <tr class="text-brand-dark uppercase tracking-widest font-bold text-[9px] thick-border-bottom">
+                                <th class="pb-2 text-left">Shift Type</th>
+                                <th class="pb-2 pl-2">Barista</th>
+                                <th class="pb-2 text-center w-24">Hours</th>
+                                <th class="pb-2 text-right w-24">Payout</th>
+                                <th class="pb-2 text-center w-8 no-print"></th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {day.shifts.map((shift) => (
+                                <tr key={shift.id} class="border-b border-brand-border/30 hover:bg-brand-light/40 transition">
+                                  <td class="py-2">
+                                    <input 
+                                      type="text" 
+                                      value={shift.shift}
+                                      onChange={(e) => handleShiftNameChange(day.dateIso, shift.id, e.target.value)}
+                                      class="w-full bg-transparent focus:bg-white px-1 py-1 text-xs focus:outline-none focus:border-brand-accent"
+                                    />
+                                  </td>
+                                  <td class="py-2 pl-2">
+                                    <input 
+                                      type="text"
+                                      placeholder="Name"
+                                      value={shift.name}
+                                      onChange={(e) => handleNameChange(day.dateIso, shift.id, e.target.value)}
+                                      class="w-full bg-brand-light/50 sharp-border px-2 py-1 text-xs focus:outline-none focus:bg-white focus:border-brand-accent font-bold transition"
+                                    />
+                                  </td>
+                                  <td class="py-2 text-center">
+                                    <input 
+                                      type="number"
+                                      step="0.01"
+                                      min="0"
+                                      value={shift.hrs}
+                                      onChange={(e) => handleHoursChange(day.dateIso, shift.id, e.target.value)}
+                                      class="w-16 text-center bg-white sharp-border px-1 py-1 text-xs font-bold focus:outline-none focus:border-brand-accent transition"
+                                    />
+                                  </td>
+                                  <td class="py-2 text-right font-bold text-xs">
+                                    ${shift.payout.toFixed(2)}
+                                  </td>
+                                  <td class="py-2 text-center no-print">
+                                    <button 
+                                      onClick={() => deleteShift(day.dateIso, shift.id)}
+                                      class="text-brand-dark hover:text-red-700 font-bold"
+                                    >
+                                      ✕
+                                    </button>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+
+                          {day.shifts.length === 0 && (
+                            <div class="text-center py-6 text-brand-darkMuted text-xs font-bold uppercase tracking-widest italic border-b border-brand-border/30">
+                              No shifts configured.
+                            </div>
+                          )}
+
+                          <div class="mt-4 flex items-center justify-between text-[10px] uppercase tracking-widest font-bold">
+                            <button 
+                              onClick={() => addCustomShift(day.dateIso)}
+                              class="text-brand-accent hover:text-brand-dark no-print transition"
+                            >
+                              + Add Row
+                            </button>
+
+                            <div class="flex items-center space-x-4">
+                              <span>Hrs: {day.totalHours.toFixed(2)}</span>
+                              <div class="flex items-center space-x-2">
+                                <span>Disbursed: ${day.totalPaidOut.toFixed(2)}</span>
+                                {day.isBalanced && day.tipsVal > 0 ? (
+                                  <span class="text-brand-accent font-bold text-xs" title="Matches perfectly.">✓</span>
+                                ) : day.tipsVal > 0 ? (
+                                  <span class="text-red-700 font-bold text-xs" title="Penny mismatch warning.">!</span>
+                                ) : null}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* WEEK 2 PANEL (Only if 14 days selected) */}
+              {periodLength === 14 && (activeTab === "all" || activeTab === "week2") && (
+                <div class="space-y-6">
+                  {processedDays.slice(7, 14).map((day) => {
+                    const formattedDateStr = day.dateIso ? formatLocalDateString(day.dateIso) : day.dayLabel;
+
+                    return (
+                      <div key={`day-card-${day.dateIso}`} class="bg-white sharp-border print-card">
+                        
+                        <div class="bg-white text-brand-dark p-4 flex items-center justify-between border-double-bottom">
+                          <div>
+                            <h3 class="font-bold text-sm uppercase tracking-widest">{day.dayLabel}</h3>
+                            <p class="text-[10px] uppercase tracking-widest mt-1 text-brand-accent">{formattedDateStr}</p>
+                          </div>
+                          <div class="text-right">
+                            <span class="text-[9px] uppercase tracking-widest block font-bold">Daily Tips</span>
+                            <span class="text-sm font-bold">${day.tipsVal.toFixed(2)}</span>
+                          </div>
+                        </div>
+
+                        <div class="p-4">
+                          <table class="w-full text-left text-xs border-collapse">
+                            <thead>
+                              <tr class="text-brand-dark uppercase tracking-widest font-bold text-[9px] thick-border-bottom">
+                                <th class="pb-2 text-left">Shift Type</th>
+                                <th class="pb-2 pl-2">Barista</th>
+                                <th class="pb-2 text-center w-24">Hours</th>
+                                <th class="pb-2 text-right w-24">Payout</th>
+                                <th class="pb-2 text-center w-8 no-print"></th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {day.shifts.map((shift) => (
+                                <tr key={shift.id} class="border-b border-brand-border/30 hover:bg-brand-light/40 transition">
+                                  <td class="py-2">
+                                    <input 
+                                      type="text" 
+                                      value={shift.shift}
+                                      onChange={(e) => handleShiftNameChange(day.dateIso, shift.id, e.target.value)}
+                                      class="w-full bg-transparent focus:bg-white px-1 py-1 text-xs focus:outline-none focus:border-brand-accent"
+                                    />
+                                  </td>
+                                  <td class="py-2 pl-2">
+                                    <input 
+                                      type="text"
+                                      placeholder="Name"
+                                      value={shift.name}
+                                      onChange={(e) => handleNameChange(day.dateIso, shift.id, e.target.value)}
+                                      class="w-full bg-brand-light/50 sharp-border px-2 py-1 text-xs focus:outline-none focus:bg-white focus:border-brand-accent font-bold transition"
+                                    />
+                                  </td>
+                                  <td class="py-2 text-center">
+                                    <input 
+                                      type="number"
+                                      step="0.01"
+                                      min="0"
+                                      value={shift.hrs}
+                                      onChange={(e) => handleHoursChange(day.dateIso, shift.id, e.target.value)}
+                                      class="w-16 text-center bg-white sharp-border px-1 py-1 text-xs font-bold focus:outline-none focus:border-brand-accent transition"
+                                    />
+                                  </td>
+                                  <td class="py-2 text-right font-bold text-xs">
+                                    ${shift.payout.toFixed(2)}
+                                  </td>
+                                  <td class="py-2 text-center no-print">
+                                    <button 
+                                      onClick={() => deleteShift(day.dateIso, shift.id)}
+                                      class="text-brand-dark hover:text-red-700 font-bold"
+                                    >
+                                      ✕
+                                    </button>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+
+                          {day.shifts.length === 0 && (
+                            <div class="text-center py-6 text-brand-darkMuted text-xs font-bold uppercase tracking-widest italic border-b border-brand-border/30">
+                              No shifts configured.
+                            </div>
+                          )}
+
+                          <div class="mt-4 flex items-center justify-between text-[10px] uppercase tracking-widest font-bold">
+                            <button 
+                              onClick={() => addCustomShift(day.dateIso)}
+                              class="text-brand-accent hover:text-brand-dark no-print transition"
+                            >
+                              + Add Row
+                            </button>
+
+                            <div class="flex items-center space-x-4">
+                              <span>Hrs: {day.totalHours.toFixed(2)}</span>
+                              <div class="flex items-center space-x-2">
+                                <span>Disbursed: ${day.totalPaidOut.toFixed(2)}</span>
+                                {day.isBalanced && day.tipsVal > 0 ? (
+                                  <span class="text-brand-accent font-bold text-xs" title="Matches perfectly.">✓</span>
+                                ) : day.tipsVal > 0 ? (
+                                  <span class="text-red-700 font-bold text-xs" title="Penny mismatch warning.">!</span>
+                                ) : null}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+            </div>
+
+            {/* PAYROLL SUMMARY LEDGER SECTION */}
+            <section class={`mt-8 bg-white sharp-border ${activeTab === 'payroll' ? 'block' : 'block no-print'}`}>
+              <div class="bg-white text-brand-dark p-6 flex flex-col md:flex-row md:items-center justify-between gap-4 border-double-bottom">
+                <div>
+                  <h2 class="text-base uppercase tracking-widest font-bold">Payroll Summary</h2>
+                  <p class="text-[10px] text-brand-accent mt-1 uppercase tracking-widest">Aggregated Tip Distributions</p>
+                </div>
+                <div class="flex space-x-2 no-print text-[10px] uppercase font-bold tracking-widest">
+                  <button 
+                    onClick={handleCopyClipboard}
+                    class="sharp-border bg-white text-brand-dark hover:bg-brand-light transition px-4 py-2"
+                  >
+                    Copy
+                  </button>
+                  <button 
+                    onClick={handleExportCSV}
+                    class="sharp-border bg-brand-dark text-white hover:bg-brand-accent hover:border-brand-accent transition px-4 py-2"
+                  >
+                    Export
+                  </button>
+                </div>
+              </div>
+
+              <div class="p-6">
+                <table class="w-full text-left text-xs border-collapse">
+                  <thead>
+                    <tr class="text-brand-dark uppercase tracking-widest font-bold text-[10px] thick-border-bottom">
+                      <th class="pb-3 text-left">Barista</th>
+                      <th class="pb-3 text-center">Shifts</th>
+                      <th class="pb-3 text-center">Hours</th>
+                      <th class="pb-3 text-right">Payout</th>
+                      <th class="pb-3 text-right">Avg Rate</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {payrollAggregation.baristas.map((barista) => {
+                      const effRate = barista.totalHours > 0 ? (barista.totalPayout / barista.totalHours).toFixed(2) : "0.00";
+                      return (
+                        <tr key={`payroll-${barista.name}`} class="border-b border-brand-border/30">
+                          <td class="py-3 font-bold text-sm">
+                            {barista.name}
+                          </td>
+                          <td class="py-3 text-center">
+                            {barista.shiftsCount}
+                          </td>
+                          <td class="py-3 text-center font-bold">
+                            {barista.totalHours.toFixed(2)}
+                          </td>
+                          <td class="py-3 text-right font-bold text-sm">
+                            ${barista.totalPayout.toFixed(2)}
+                          </td>
+                          <td class="py-3 text-right text-[10px]">
+                            ${effRate}/hr
+                          </td>
+                        </tr>
+                      );
+                    })}
+
+                    {payrollAggregation.unnamed.totalPayout > 0 && (
+                      <tr class="border-b border-brand-border/30 bg-brand-light/50">
+                        <td class="py-3 font-bold pl-2">
+                          [Unnamed]
+                        </td>
+                        <td class="py-3 text-center">
+                          -
+                        </td>
+                        <td class="py-3 text-center font-bold">
+                          {payrollAggregation.unnamed.totalHours.toFixed(2)}
+                        </td>
+                        <td class="py-3 text-right font-bold text-sm">
+                          ${payrollAggregation.unnamed.totalPayout.toFixed(2)}
+                        </td>
+                        <td class="py-3 text-right text-[10px]">
+                          -
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                  <tfoot>
+                    <tr class="border-double-top">
+                      <td class="py-3 font-bold uppercase tracking-widest">
+                        Total
+                      </td>
+                      <td class="py-3 text-center"></td>
+                      <td class="py-3 text-center font-bold">
+                        {(payrollAggregation.baristas.reduce((acc, b) => acc + b.totalHours, 0) + payrollAggregation.unnamed.totalHours).toFixed(2)}
+                      </td>
+                      <td class="py-3 text-right font-bold text-base">
+                        ${totals.grandTotal.toFixed(2)}
+                      </td>
+                      <td class="py-3 text-right text-[10px] uppercase font-bold text-brand-accent tracking-widest">
+                        Balanced
+                      </td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            </section>
+          </main>
+
+          <footer class="mt-12 text-center text-[10px] uppercase tracking-widest font-bold py-8 border-t border-brand-dark w-full max-w-7xl mx-auto px-6 no-print">
+            <p>Internal Management Utility</p>
+          </footer>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
